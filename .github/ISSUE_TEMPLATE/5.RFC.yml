@@ -1,6 +1,7 @@
 name: "💬 RFC"
 description: "Request for Comments"
-
+title: "[RFC]: "
+labels: ["RFC"]
 
 body:
 - type: textarea
