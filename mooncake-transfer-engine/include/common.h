@@ -22,13 +22,13 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <ctime>
-#include <thread>
-#include <iostream>
-#include <chrono>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
+#include <thread>
 
 #include "error.h"
 
@@ -50,6 +50,7 @@ const static int LOCAL_SEGMENT_ID = 0;
 enum class HandShakeRequestType {
     Connection = 0,
     Metadata = 1,
+    Notify = 2,
     // placeholder for old protocol without RequestType
     OldProtocol = 0xff,
 };
@@ -106,9 +107,12 @@ static inline std::string getCurrentDateTime() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
     auto local_time = *std::localtime(&time_t_now);
-    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) % 1000000;
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                      now.time_since_epoch()) %
+                  1000000;
     std::ostringstream oss;
-    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "." << std::setw(6) << std::setfill('0') << micros.count();
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
+        << std::setw(6) << std::setfill('0') << micros.count();
     return oss.str();
 }
 
@@ -127,6 +131,46 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
                      << ". Use default port " << port << " instead";
     else
         port = (uint16_t)val;
+    return std::make_pair(trimmed_server_name, port);
+}
+
+static inline std::pair<std::string, uint16_t> parseHostNameWithPortAscend(
+    const std::string &server_name, int *device_id) {
+    uint16_t port = getDefaultHandshakePort();
+    auto pos = server_name.find(':');
+    if (pos == server_name.npos) {
+        return std::make_pair(server_name, port);
+    }
+    auto trimmed_server_name = server_name.substr(0, pos);
+    auto remaining = server_name.substr(pos + 1);
+    auto second_pods = remaining.find(':');
+    if (second_pods == remaining.npos) {
+        int val = std::atoi(remaining.c_str());
+        if (val <= 0 || val > 65535) {
+            LOG(WARNING) << "Illegal port number in " << server_name
+                         << ". Use default port " << port << " instead";
+        } else {
+            port = (uint16_t)val;
+        }
+        return std::make_pair(trimmed_server_name, port);
+    }
+    auto port_str = remaining.substr(0, second_pods);
+    auto npu_str = remaining.substr(second_pods + 1);
+
+    int val = std::atoi(port_str.c_str());
+    if (val <= 0 || val > 65535) {
+        LOG(WARNING) << "Illegal port number in " << server_name
+                     << ". Use default port " << port << " instead";
+    } else {
+        port = (uint16_t)val;
+    }
+
+    auto npu_ops = npu_str.find('_');
+    if (npu_ops != npu_str.npos && npu_ops != 0 && npu_ops != npu_str.size() - 1) {
+        auto npu_value_str = npu_str.substr(npu_ops + 1);
+        *device_id = std::atoi(npu_value_str.c_str());
+    }
+
     return std::make_pair(trimmed_server_name, port);
 }
 
@@ -216,7 +260,7 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
         return {type, ""};
     }
 
-    if (buffer[0] <= static_cast<char>(HandShakeRequestType::Metadata)) {
+    if (buffer[0] <= static_cast<char>(HandShakeRequestType::Notify)) {
         type = static_cast<HandShakeRequestType>(buffer[0]);
         str.assign(buffer.data() + sizeof(char), length - sizeof(char));
     } else {

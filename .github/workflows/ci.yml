@@ -23,6 +23,16 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Install and start etcd
+      run: |
+        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
+        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
+        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
+        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
+        sleep 3 # Give etcd time to start
+        etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+      shell: bash
+
     - name: Free up disk space
       run: |
         sudo rm -rf /usr/share/dotnet
@@ -57,7 +67,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
       shell: bash
 
     - name: Build project
@@ -67,11 +77,11 @@ jobs:
         sudo make install
       shell: bash
 
-    - name: Build hook.so
+    - name: Build nvlink_allocator.so
       run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-hook
-        cd mooncake-transfer-engine/nvlink-hook
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-hook/
+        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+        cd mooncake-transfer-engine/nvlink-allocator
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Start Metadata Server
@@ -92,7 +102,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata make test -j ARGS="-V"
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_STORE_MEMCPY=false make test -j ARGS="-V"
       shell: bash
 
     - name: Stop Mooncake Master Service
@@ -162,7 +172,7 @@ jobs:
     - name: Run tests
       run: |
         source test_env/bin/activate
-        ./scripts/run_tests.sh
+        MC_STORE_MEMCPY=false ./scripts/run_tests.sh
         deactivate
       shell: bash
 
@@ -223,7 +233,7 @@ jobs:
         cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_NVLINK=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
         make -j
         sudo make install
       shell: bash
@@ -232,9 +242,9 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_NVLINK=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
-      # TODO: lack USE_NVMEOF,USE_CUDA,USE_NVLINK
+      # TODO: lack USE_NVMEOF,USE_CUDA,USE_MNNVL
 
     - name: Build project with all settings are ON
       run: |
@@ -270,11 +280,11 @@ jobs:
         sudo make install
       shell: bash
 
-    - name: Build hook.so
+    - name: Build nvlink_allocator.so
       run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-hook
-        cd mooncake-transfer-engine/nvlink-hook
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-hook/
+        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+        cd mooncake-transfer-engine/nvlink-allocator
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Generate Python version tag
@@ -296,7 +306,7 @@ jobs:
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
   build-docker:
-    name: Builcd Docker Image
+    name: Build Docker Image
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4

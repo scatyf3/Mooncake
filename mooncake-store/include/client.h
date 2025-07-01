@@ -1,14 +1,17 @@
 #pragma once
 
+#include <boost/functional/hash.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "ha_helper.h"
 #include "master_client.h"
 #include "rpc_service.h"
 #include "transfer_engine.h"
+#include "transfer_task.h"
 #include "types.h"
 
 namespace mooncake {
@@ -26,7 +29,9 @@ class Client {
      * @param metadata_connstring Connection string for metadata service
      * @param protocol Transfer protocol ("rdma" or "tcp")
      * @param protocol_args Protocol-specific arguments
-     * @param master_addr Master server address
+     * @param master_server_entry The entry of master server (IP:Port of master
+     *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
+     *        HA mode)
      * @return std::optional containing a shared_ptr to Client if successful,
      * std::nullopt otherwise
      */
@@ -34,7 +39,7 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         void** protocol_args,
-        const std::string& master_addr = kDefaultMasterAddress);
+        const std::string& master_server_entry = kDefaultMasterAddress);
 
     /**
      * @brief Retrieves data for a given key
@@ -45,9 +50,9 @@ class Client {
     ErrorCode Get(const std::string& object_key, std::vector<Slice>& slices);
 
     /**
-     * @brief Gets object metadata without transferring data
+     * @brief Batch retrieve data for multiple keys
      * @param object_keys Keys to query
-     * @param slices Output parameter for the retrieved data
+     * @param slices Map of object keys to their data slices
      */
     ErrorCode BatchGet(
         const std::vector<std::string>& object_keys,
@@ -97,7 +102,7 @@ class Client {
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
      * @param object_infos Previously queried object metadata
-     * @param slices Vector of slices to store the data
+     * @param slices Map of object keys to their data slices
      * @return ErrorCode indicating success/failure
      */
     ErrorCode BatchGet(
@@ -118,7 +123,7 @@ class Client {
     /**
      * @brief Batch put data with replication
      * @param keys Object keys
-     * @param batched_slices Vector of data slices to store
+     * @param batched_slices Map of object keys to their data slices
      * @param config Replication configuration
      */
     ErrorCode BatchPut(
@@ -141,21 +146,19 @@ class Client {
 
     /**
      * @brief Registers a memory segment to master for allocation
-     * @param segment_name Unique identifier for the segment
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode MountSegment(const std::string& segment_name, const void* buffer,
-                           size_t size);
+    ErrorCode MountSegment(const void* buffer, size_t size);
 
     /**
      * @brief Unregisters a memory segment from master
-     * @param segment_name Name of the segment to unregister
-     * @param addr Memory address to unregister
+     * @param buffer Memory buffer to unregister
+     * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    ErrorCode UnmountSegment(const std::string& segment_name, void* addr);
+    ErrorCode UnmountSegment(const void* buffer, size_t size);
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -187,6 +190,15 @@ class Client {
      */
     ErrorCode IsExist(const std::string& key);
 
+    /**
+     * @brief Checks if multiple objects exist
+     * @param keys Vector of keys to check
+     * @param exist_results Output vector of existence results for each key
+     * @return ErrorCode indicating success/failure of the batch operation
+     */
+    ErrorCode BatchIsExist(const std::vector<std::string>& keys,
+                           std::vector<ErrorCode>& exist_results);
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -197,7 +209,7 @@ class Client {
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
-    ErrorCode ConnectToMaster(const std::string& master_addr);
+    ErrorCode ConnectToMaster(const std::string& master_server_entry);
     ErrorCode InitTransferEngine(const std::string& local_hostname,
                                  const std::string& metadata_connstring,
                                  const std::string& protocol,
@@ -212,17 +224,39 @@ class Client {
         const std::vector<AllocatedBuffer::Descriptor>& handles,
         std::vector<Slice>& slices);
 
+    /**
+     * @brief Find the first complete replica from a replica list
+     * @param replica_list List of replicas to search through
+     * @param handles Output vector to store the buffer handles of the found
+     * replica
+     * @return ErrorCode::OK if found, ErrorCode::INVALID_REPLICA if no complete
+     * replica
+     */
+    ErrorCode FindFirstCompleteReplica(
+        const std::vector<Replica::Descriptor>& replica_list,
+        std::vector<AllocatedBuffer::Descriptor>& handles);
+
     // Core components
     TransferEngine transfer_engine_;
     MasterClient master_client_;
+    std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
-    std::unordered_map<std::string, void*> mounted_segments_;
+    std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+
+    // For high availability
+    MasterViewHelper master_view_helper_;
+    std::thread ping_thread_;
+    std::atomic<bool> ping_running_{false};
+    void PingThreadFunc();
+
+    // Client identification
+    UUID client_id_;
 };
 
 }  // namespace mooncake

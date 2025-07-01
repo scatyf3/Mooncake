@@ -39,7 +39,7 @@
 #include <cufile.h>
 #endif
 
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
 #include <transport/nvlink_transport/nvlink_transport.h>
 #endif
 
@@ -55,7 +55,7 @@ static void checkCudaError(cudaError_t result, const char *message) {
 #endif
 
 #ifdef USE_CUDA
-const static int NR_SOCKETS = 1;
+const static int NR_SOCKETS = 4;
 #else
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
@@ -79,9 +79,9 @@ DEFINE_string(nic_priority_matrix, "",
 DEFINE_string(segment_id, "192.168.3.76", "Segment ID to access data");
 DEFINE_uint64(buffer_size, 1ull << 30, "total size of data buffer");
 DEFINE_int32(batch_size, 128, "Batch size");
-DEFINE_uint64(block_size, 4096, "Block size for each transfer request");
+DEFINE_uint64(block_size, 65536, "Block size for each transfer request");
 DEFINE_int32(duration, 10, "Test duration in seconds");
-DEFINE_int32(threads, 4, "Task submission threads");
+DEFINE_int32(threads, 12, "Task submission threads");
 DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
@@ -100,7 +100,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
         d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
@@ -114,7 +114,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 
 static void freeMemoryPool(void *addr, size_t size) {
 #ifdef USE_CUDA
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, addr);
     if (result == CUDA_SUCCESS) {
@@ -309,7 +309,6 @@ int initiator() {
     int buffer_num = NR_SOCKETS;
 
 #ifdef USE_CUDA
-    buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
@@ -403,15 +402,9 @@ int target() {
     int buffer_num = NR_SOCKETS;
 
 #ifdef USE_CUDA
-    buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
-#ifdef USE_NVLINK
-        addr[i] = mooncake::NvlinkTransport::allocatePinnedLocalMemory(
-            FLAGS_buffer_size);
-#else
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-#endif
         std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              name_prefix + std::to_string(i));
@@ -431,7 +424,7 @@ int target() {
     while (target_running) sleep(1);
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
 #else
         freeMemoryPool(addr[i], FLAGS_buffer_size);

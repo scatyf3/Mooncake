@@ -1,18 +1,21 @@
 #pragma once
+#include <ylt/struct_json/json_reader.h>
+#include <ylt/struct_json/json_writer.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <thread>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
-#include <ylt/struct_json/json_reader.h>
-#include <ylt/struct_json/json_writer.h>
 
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
+
 namespace mooncake {
 
 struct ExistKeyResponse {
@@ -77,25 +80,52 @@ struct MountSegmentResponse {
 };
 YLT_REFL(MountSegmentResponse, error_code)
 
+struct ReMountSegmentResponse {
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(ReMountSegmentResponse, error_code)
+
 struct UnmountSegmentResponse {
     ErrorCode error_code = ErrorCode::OK;
 };
 YLT_REFL(UnmountSegmentResponse, error_code)
 
+struct PingResponse {
+    ViewVersionId view_version = 0;
+    ClientStatus client_status = ClientStatus::UNDEFINED;
+    ErrorCode error_code = ErrorCode::OK;
+};
+YLT_REFL(PingResponse, view_version, client_status, error_code)
+
+struct BatchExistResponse {
+    std::vector<ErrorCode> exist_responses;
+};
+YLT_REFL(BatchExistResponse, exist_responses)
+
 constexpr uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
    public:
-    WrappedMasterService(bool enable_gc, uint64_t default_kv_lease_ttl,
-                         bool enable_metric_reporting = true,
-                         uint16_t http_port = 9003,
-                         double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                         double eviction_low_watermark_ratio = DEFAULT_EVICTION_HIGH_WATERMARK_RATIO)
-        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio, eviction_low_watermark_ratio),
+    WrappedMasterService(
+        bool enable_gc, uint64_t default_kv_lease_ttl,
+        bool enable_metric_reporting = true, uint16_t http_port = 9003,
+        double eviction_ratio = DEFAULT_EVICTION_RATIO,
+        double eviction_high_watermark_ratio =
+            DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+        ViewVersionId view_version = 0,
+        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
+        bool enable_ha = false)
+        : master_service_(enable_gc, default_kv_lease_ttl, eviction_ratio,
+                          eviction_high_watermark_ratio, view_version,
+                          client_live_ttl_sec, enable_ha),
           http_server_(4, http_port),
-          metric_report_running_(enable_metric_reporting) {
+          metric_report_running_(enable_metric_reporting),
+          view_version_(view_version) {
         // Initialize HTTP server for metrics
         init_http_server();
+
+        // Set the config for metric reporting
+        MasterMetricManager::instance().set_enable_ha(enable_ha);
 
         // Start metric reporting thread if enabled
         if (enable_metric_reporting) {
@@ -152,8 +182,9 @@ class WrappedMasterService {
                 response = GetReplicaList(std::string(key));
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
-                for(size_t i = 0; i < response.replica_list.size(); i++) {
-                    for(const auto& handle : response.replica_list[i].buffer_descriptors) {
+                for (size_t i = 0; i < response.replica_list.size(); i++) {
+                    for (const auto& handle :
+                         response.replica_list[i].buffer_descriptors) {
                         std::string tmp = "";
                         struct_json::to_json(handle, tmp);
                         ss += tmp;
@@ -169,9 +200,9 @@ class WrappedMasterService {
             [&](coro_http_request& req, coro_http_response& resp) {
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
-                std::vector<std::string>  all_keys;
+                std::vector<std::string> all_keys;
                 master_service_.GetAllKeys(all_keys);
-                for(const auto & key : all_keys) {
+                for (const auto& key : all_keys) {
                     ss += key;
                     ss += "\n";
                 }
@@ -184,9 +215,9 @@ class WrappedMasterService {
             [&](coro_http_request& req, coro_http_response& resp) {
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
-                std::vector<std::string>  all_segments;
+                std::vector<std::string> all_segments;
                 master_service_.GetAllSegments(all_segments);
-                for(const auto & segment: all_segments) {
+                for (const auto& segment : all_segments) {
                     ss += segment;
                     ss += "\n";
                 }
@@ -201,8 +232,8 @@ class WrappedMasterService {
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 std::string ss = "";
                 size_t used = 0, capacity = 0;
-                if(master_service_.QuerySegments(std::string(segment), used, capacity) 
-                   == ErrorCode::OK) {
+                if (master_service_.QuerySegments(std::string(segment), used,
+                                                  capacity) == ErrorCode::OK) {
                     ss += segment;
                     ss += "\n";
                     ss += "Used(bytes): ";
@@ -244,6 +275,15 @@ class WrappedMasterService {
             MasterMetricManager::instance().inc_exist_key_failures();
         }
 
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    BatchExistResponse BatchExistKey(const std::vector<std::string>& keys) {
+        ScopedVLogTimer timer(1, "BatchExistKey");
+        timer.LogRequest("keys_count=", keys.size());
+
+        BatchExistResponse response{master_service_.BatchExistKey(keys)};
         timer.LogResponseJson(response);
         return response;
     }
@@ -436,44 +476,82 @@ class WrappedMasterService {
         return response;
     }
 
-    MountSegmentResponse MountSegment(uint64_t buffer, uint64_t size,
-                                      const std::string& segment_name) {
+    MountSegmentResponse MountSegment(const Segment& segment,
+                                      const UUID& client_id) {
         ScopedVLogTimer timer(1, "MountSegment");
-        timer.LogRequest("buffer=", buffer, ", size=", size,
-                         ", segment_name=", segment_name);
+        timer.LogRequest("base=", segment.base, ", size=", segment.size,
+                         ", segment_name=", segment.name, ", id=", segment.id);
 
         // Increment request metric
         MasterMetricManager::instance().inc_mount_segment_requests();
 
         MountSegmentResponse response;
-        response.error_code =
-            master_service_.MountSegment(buffer, size, segment_name);
+        response.error_code = master_service_.MountSegment(segment, client_id);
 
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_mount_segment_failures();
-        } else {
-            // Update total capacity on successful mount
-            MasterMetricManager::instance().inc_total_capacity(size);
         }
 
         timer.LogResponseJson(response);
         return response;
     }
 
-    UnmountSegmentResponse UnmountSegment(const std::string& segment_name) {
+    ReMountSegmentResponse ReMountSegment(const std::vector<Segment>& segments,
+                                          const UUID& client_id) {
+        ScopedVLogTimer timer(1, "ReMountSegment");
+        timer.LogRequest("segments_count=", segments.size(),
+                         ", client_id=", client_id);
+
+        // Increment request metric
+        MasterMetricManager::instance().inc_remount_segment_requests();
+
+        ReMountSegmentResponse response;
+        response.error_code =
+            master_service_.ReMountSegment(segments, client_id);
+
+        // Track failures if needed
+        if (response.error_code != ErrorCode::OK) {
+            MasterMetricManager::instance().inc_remount_segment_failures();
+        }
+
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    UnmountSegmentResponse UnmountSegment(const UUID& segment_id,
+                                          const UUID& client_id) {
         ScopedVLogTimer timer(1, "UnmountSegment");
-        timer.LogRequest("segment_name=", segment_name);
+        timer.LogRequest("segment_id=", segment_id);
 
         // Increment request metric
         MasterMetricManager::instance().inc_unmount_segment_requests();
 
         UnmountSegmentResponse response;
-        response.error_code = master_service_.UnmountSegment(segment_name);
+        response.error_code =
+            master_service_.UnmountSegment(segment_id, client_id);
 
         // Track failures if needed
         if (response.error_code != ErrorCode::OK) {
             MasterMetricManager::instance().inc_unmount_segment_failures();
+        }
+
+        timer.LogResponseJson(response);
+        return response;
+    }
+
+    PingResponse Ping(const UUID& client_id) {
+        ScopedVLogTimer timer(1, "Ping");
+        timer.LogRequest("client_id=", client_id);
+
+        MasterMetricManager::instance().inc_ping_requests();
+
+        PingResponse response;
+        response.error_code = master_service_.Ping(
+            client_id, response.view_version, response.client_status);
+
+        if (response.error_code != ErrorCode::OK) {
+            MasterMetricManager::instance().inc_ping_failures();
         }
 
         timer.LogResponseJson(response);
@@ -485,6 +563,45 @@ class WrappedMasterService {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
+    ViewVersionId view_version_;
 };
+
+inline void RegisterRpcService(
+    coro_rpc::coro_rpc_server& server,
+    mooncake::WrappedMasterService& wrapped_master_service) {
+    server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
+            &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchPutEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchPutRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::Remove>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::Ping>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
+        &wrapped_master_service);
+}
 
 }  // namespace mooncake

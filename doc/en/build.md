@@ -1,12 +1,17 @@
 # Build Guide
 
-This document describes how to build Mooncake.
+This document describes how to build Mooncake from source.
+
+- Note: we have prebuild the pypi wheel for Ubuntu 22.04/24.04, you can simply install mooncake with pip/pip3.
+   ```bash
+   pip3 install mooncake-transfer-engine --upgrade
+   ```
 
 ## Automatic
 
 ### Recommended Version
 - OS: Ubuntu 22.04 LTS+
-- cmake: 3.16.x
+- cmake: 3.20.x
 - gcc: 9.4+
 
 ### Steps
@@ -26,8 +31,6 @@ This document describes how to build Mooncake.
    ```bash
    sudo make install
    ```
-
-Note: If you plan to use Mooncake Store with vLLM, you need to have the package `mooncake_vllm_adaptor` installed in your active python library. You can verify if the package exists by running `python -c "import mooncake_vllm_adaptor"`. If the package is missing, you can manually copy the built shared library into your python library directory (e.g. `cp ./build/mooncake-integration/mooncake_vllm_adaptor.cpython-310-x86_64-linux-gnu.so .venv/lib/python3.10/site-packages/`)
 
 ## Manual
 
